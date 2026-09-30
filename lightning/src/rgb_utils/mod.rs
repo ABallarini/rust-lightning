@@ -15,6 +15,7 @@ use crate::ln::types::ChannelId;
 use crate::sign::SignerProvider;
 use crate::types::features::ChannelTypeFeatures;
 use crate::types::payment::PaymentHash;
+use crate::util::logger::Logger;
 
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::hashes::{sha256, Hash};
@@ -338,6 +339,29 @@ where
 		output_map.insert(vout_p2wsh as u32, vout_p2wsh_amt);
 	}
 
+	// Only one side of the channel allocates RGB to each commitment: the funding
+	// (outbound) party colors its own commitment, the receiving (inbound) party
+	// colors the counterparty's. The channel funding carries a single RGB allocation,
+	// and every commitment spends the same funding outpoint, so at most one commitment
+	// can ever be colored. Penalties only ever spend the *counterparty* commitment, so
+	// the receiving party must be the one holding the allocation for it. Coloring the
+	// same commitment from both views is deterministic (same STATIC_BLINDING and
+	// commitment contents), so the counterparty's colored copy matches the one the
+	// funding party actually broadcasts. The other view is left uncolored.
+	let is_funder = funding_scope.is_outbound();
+	if is_funder == counterparty {
+		// The side that cannot spend this commitment on-chain keeps it uncolored but
+		// still records the transfer info under the uncolored txid, so HTLC resolution
+		// on this commitment can look it up. No RGB allocation is created for it.
+		let transfer_info = TransferInfo { contract_id, output_map };
+		let txid = commitment_tx.compute_txid();
+		write_rgb_transfer_info(
+			&ldk_data_dir.join(format!("{txid}_transfer_info")),
+			&transfer_info,
+		);
+		return Ok(());
+	}
+
 	let asset_coloring_info = AssetColoringInfo {
 		output_map: output_map.clone(),
 		static_blinding: Some(STATIC_BLINDING),
@@ -386,7 +410,19 @@ pub(crate) fn color_htlc(
 	let commitment_txid = consignment_htlc_outpoint.txid.to_string();
 
 	let transfer_info_path = ldk_data_dir.join(format!("{commitment_txid}_transfer_info"));
-	let transfer_info = read_rgb_transfer_info(&transfer_info_path);
+	let transfer_info = match fs::read_to_string(&transfer_info_path) {
+		Ok(serialized_info) => match serde_json::from_str::<TransferInfo>(&serialized_info) {
+			Ok(transfer_info) => transfer_info,
+			Err(e) => {
+				eprintln!("unable to color HTLC transaction: corrupt RGB transfer info for {commitment_txid}: {e}");
+				return Ok(());
+			},
+		},
+		Err(e) => {
+			eprintln!("unable to color HTLC transaction: missing RGB transfer info for {commitment_txid}: {e}");
+			return Ok(());
+		},
+	};
 	let contract_id = transfer_info.contract_id;
 
 	let output_map = HashMap::from([(0, htlc_amount_rgb)]);
@@ -404,7 +440,14 @@ pub(crate) fn color_htlc(
 	let handle = Handle::current();
 	let _ = handle.enter();
 	let wallet = futures::executor::block_on(_get_rgb_wallet(ldk_data_dir));
-	let (fascia, _) = wallet.color_psbt(&mut psbt, coloring_info).unwrap();
+	let (fascia, _) =
+		match wallet.color_psbt(&mut psbt, coloring_info) {
+			Ok(res) => res,
+			Err(e) => {
+				eprintln!("unable to color HTLC transaction for {commitment_txid}: {e} (leaving uncolored)");
+				return Ok(());
+			},
+		};
 	let psbt = Psbt::from_str(&psbt.to_string()).unwrap();
 	let modified_tx = match psbt.extract_tx() {
 		Ok(tx) => tx,
@@ -413,13 +456,155 @@ pub(crate) fn color_htlc(
 	};
 	let txid = &modified_tx.compute_txid();
 
-	wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)).unwrap();
+	if let Err(e) = wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)) {
+		eprintln!(
+			"unable to consume RGB fascia for HTLC transaction {txid}: {e} (leaving uncolored)"
+		);
+		return Ok(());
+	}
 
 	// save RGB transfer data to disk
 	let transfer_info = TransferInfo { contract_id, output_map };
 	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
 	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
 
+	Ok(())
+}
+
+/// Logs that a justice (penalty) sweep could not be colored and returns the graceful
+/// `Ok(())` signal, leaving the transaction uncolored. This burns the RGB assets held on
+/// the revoked commitment, so the reason must be surfaced at error level.
+fn uncolored_fallback(
+	logger: &dyn Logger, prev_txid: &str, reason: &str,
+) -> Result<(), ChannelError> {
+	log_error!(
+		logger,
+		"Unable to color justice transaction for {prev_txid}: {reason} \
+		 (falling back to uncolored)",
+	);
+	Ok(())
+}
+
+/// Color a claim (justice/penalty) transaction.
+///
+/// Reads `{prev_txid}_transfer_info` from `ldk_data_dir` to obtain the contract and the RGB
+/// amounts assigned to each vout of the revoked commitment transaction, sums only the vouts
+/// actually spent by this justice transaction, colors the transaction with that total at vout 0
+/// (the destination), and writes `{new_txid}_transfer_info`. If the transfer info file is
+/// missing, corrupt, or contains zero assets, the function logs and leaves the transaction
+/// uncolored (graceful uncolored-sweep fallback).
+pub(crate) fn color_claim(
+	claim_tx: &mut Transaction, prev_txid: &str, ldk_data_dir: &Path, logger: &dyn Logger,
+) -> Result<(), ChannelError> {
+	let transfer_info_path = ldk_data_dir.join(format!("{prev_txid}_transfer_info"));
+	let serialized_info = match fs::read_to_string(&transfer_info_path) {
+		Ok(serialized_info) => serialized_info,
+		Err(e) => {
+			return uncolored_fallback(
+				logger,
+				prev_txid,
+				&format!("missing RGB transfer info: {e}"),
+			)
+		},
+	};
+	let transfer_info: TransferInfo = match serde_json::from_str(&serialized_info) {
+		Ok(transfer_info) => transfer_info,
+		Err(e) => {
+			return uncolored_fallback(
+				logger,
+				prev_txid,
+				&format!("corrupt RGB transfer info: {e}"),
+			)
+		},
+	};
+	let contract_id = transfer_info.contract_id;
+	let total_rgb: u64 = claim_tx
+		.input
+		.iter()
+		.filter(|input| input.previous_output.txid.to_string() == prev_txid)
+		.filter_map(|input| transfer_info.output_map.get(&input.previous_output.vout))
+		.sum();
+	if total_rgb == 0 {
+		return uncolored_fallback(logger, prev_txid, "zero RGB assets in transfer info");
+	}
+
+	let output_map = HashMap::from([(0, total_rgb)]);
+	let asset_coloring_info = AssetColoringInfo {
+		output_map: output_map.clone(),
+		static_blinding: Some(STATIC_BLINDING),
+	};
+	let coloring_info = ColoringInfo {
+		asset_info_map: HashMap::from_iter([(contract_id, asset_coloring_info)]),
+		static_blinding: Some(STATIC_BLINDING),
+		nonce: Some(1),
+	};
+
+	let psbt = match Psbt::from_unsigned_tx(claim_tx.clone()) {
+		Ok(p) => p,
+		Err(e) => {
+			return uncolored_fallback(logger, prev_txid, &format!("failed to build PSBT ({e})"))
+		},
+	};
+	let mut rgb_psbt = match RgbLibPsbt::from_str(&psbt.to_string()) {
+		Ok(p) => p,
+		Err(e) => {
+			return uncolored_fallback(
+				logger,
+				prev_txid,
+				&format!("failed to parse RGB PSBT ({e})"),
+			)
+		},
+	};
+	let wallet = rgb_lib::utils::block_on(_get_rgb_wallet(ldk_data_dir));
+	let (fascia, _) = match wallet.color_psbt(&mut rgb_psbt, coloring_info) {
+		Ok(res) => res,
+		Err(e) => {
+			log_error!(
+				logger,
+				"RGB wallet failed to color justice transaction for {}: {e} \
+				 (falling back to uncolored)",
+				prev_txid,
+			);
+			return Ok(());
+		},
+	};
+	let psbt = match Psbt::from_str(&rgb_psbt.to_string()) {
+		Ok(p) => p,
+		Err(e) => {
+			return uncolored_fallback(
+				logger,
+				prev_txid,
+				&format!("failed to serialize colored PSBT ({e})"),
+			)
+		},
+	};
+	let modified_tx = match psbt.extract_tx() {
+		Ok(tx) => tx,
+		Err(ExtractTxError::MissingInputValue { tx }) => tx,
+		Err(e) => {
+			return uncolored_fallback(
+				logger,
+				prev_txid,
+				&format!("failed to extract colored transaction ({e})"),
+			)
+		},
+	};
+	let txid = &modified_tx.compute_txid();
+
+	if let Err(e) = wallet.consume_fascia(fascia.clone(), Some(WitnessOrd::Ignored)) {
+		log_error!(
+			logger,
+			"Failed to consume RGB fascia for justice transaction {txid}: {e} \
+			 (falling back to uncolored)",
+		);
+		return Ok(());
+	}
+
+	let transfer_info = TransferInfo { contract_id, output_map };
+	let transfer_info_path = ldk_data_dir.join(format!("{txid}_transfer_info"));
+	write_rgb_transfer_info(&transfer_info_path, &transfer_info);
+
+	*claim_tx = modified_tx;
 	Ok(())
 }
 
